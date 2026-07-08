@@ -14,6 +14,13 @@ import {
 } from "lucide-react";
 import { useLanguage } from "@/lib/LanguageContext";
 import { downloadLegalNotice, downloadFullReport } from "@/lib/generatePDF";
+import {
+  INLINE_UPLOAD_MIME_TYPES,
+  MAX_UPLOAD_BYTES,
+  MAX_UPLOAD_LABEL,
+  TEXT_UPLOAD_EXTENSIONS,
+  UPLOAD_ACCEPT_ATTR,
+} from "@/lib/config";
 
 const sampleDocuments: { label: string; type: string; id: string; isTamil?: boolean }[] = [
   { label: "sample1", type: "rental", id: "sample-rental" },
@@ -409,105 +416,94 @@ function ShimmerCard() {
   );
 }
 
-const GEMINI_SYSTEM_PROMPT = `You are an expert Indian consumer rights and legal document analyzer. 
-Analyze this document carefully and return ONLY valid JSON — absolutely no markdown, 
-no backticks, no explanation, just raw JSON starting with { and ending with }:
 
-{
-  "summary": {
-    "type": "string describing document type",
-    "parties": ["Party 1 name", "Party 2 name"],
-    "date": "document date or Not specified",
-    "duration": "duration or Not applicable"
-  },
-  "violations": [
-    {
-      "severity": "ILLEGAL",
-      "title": "Short title of violation",
-      "description": "Clear description of the problem",
-      "law": "Exact Indian law section",
-      "amount_recoverable": "Amount or type of relief"
-    }
-  ],
-  "rights": [
-    {
-      "title": "Right name",
-      "description": "What this right means",
-      "law": "Exact law reference"
-    }
-  ],
-  "legal_actions": [
-    {
-      "title": "Action name",
-      "type": "Download",
-      "description": "What this action does"
-    }
-  ]
+
+type UploadKind =
+  | { kind: "inline"; mimeType: string }
+  | { kind: "text" }
+  | { kind: "unsupported" };
+
+function classifyUpload(file: File): UploadKind {
+  const ext = file.name.toLowerCase().split(".").pop() ?? "";
+  const mimeType = INLINE_UPLOAD_MIME_TYPES[ext];
+  if (mimeType) return { kind: "inline", mimeType };
+  if (TEXT_UPLOAD_EXTENSIONS.includes(ext)) return { kind: "text" };
+  return { kind: "unsupported" };
 }
 
-Find ALL violations. Cite Consumer Protection Act 2019, RERA, IRDA, 
-RBI Master Circulars, IPC, Model Tenancy Act 2021, Rent Control Act.
-Be specific. Return minimum 2 violations if any exist.
-If the document is in Tamil or Hindi, still return JSON in English.`;
-
-function getMimeType(file: File): string {
-  let mimeType = file.type;
-  if (!mimeType || mimeType === 'application/octet-stream') {
-    const name = file.name.toLowerCase();
-    if (name.endsWith('.pdf')) mimeType = 'application/pdf';
-    else if (name.endsWith('.jpg') || name.endsWith('.jpeg')) mimeType = 'image/jpeg';
-    else if (name.endsWith('.png')) mimeType = 'image/png';
-    else mimeType = 'image/jpeg';
-  }
-  return mimeType;
-}
-
-function fileToBase64(file: File): Promise<{ base64: string; mimeType: string }> {
+function fileToBase64(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => {
       const result = reader.result as string;
-      const base64 = result.split(",")[1];
-      resolve({ base64, mimeType: getMimeType(file) });
+      resolve(result.split(",")[1]);
     };
     reader.onerror = () => reject(new Error('FileReader failed'));
     reader.readAsDataURL(file);
   });
 }
 
-function parseGeminiJson(rawText: string): GeminiResponse {
-  let cleanText = rawText.trim();
-  // Remove any markdown code blocks if present
-  cleanText = cleanText.replace(/```json/g, '').replace(/```/g, '').trim();
-  // Find JSON boundaries
-  const jsonStart = cleanText.indexOf('{');
-  const jsonEnd = cleanText.lastIndexOf('}');
-  if (jsonStart === -1 || jsonEnd === -1) {
-    console.error('No JSON found in response:', cleanText);
-    throw new Error('Invalid JSON response');
-  }
-  cleanText = cleanText.substring(jsonStart, jsonEnd + 1);
-  return JSON.parse(cleanText);
+function fileToText(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = () => reject(new Error('FileReader failed'));
+    reader.readAsText(file);
+  });
 }
 
-async function analyzeWithGemini(
-  base64Data: string,
-  mimeType: string
-): Promise<GeminiResponse> {
-  console.log('[VAAKYA] Calling backend /api/analyze — mimeType:', mimeType, 'base64 length:', base64Data.length);
+type AnalyzePayload =
+  | { base64Data: string; mimeType: string }
+  | { textData: string };
 
-  const response = await fetch('/api/analyze', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ base64Data, mimeType }),
-  });
+class AnalyzeApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = "AnalyzeApiError";
+  }
+}
+
+function analyzeErrorMessage(status: number, serverMessage?: string): string {
+  switch (status) {
+    case 413:
+      return `This file is too large for online analysis. Please upload a file under ${MAX_UPLOAD_LABEL}.`;
+    case 429:
+      return "Too many requests right now — please wait a minute and try again.";
+    case 422:
+      return "This document couldn't be analyzed. Try a clearer scan or a different file.";
+    case 503:
+      return "The AI models are temporarily unavailable. Please try again later.";
+    case 504:
+      return "The analysis timed out. Please try again.";
+    default:
+      return serverMessage || `Analysis failed (error ${status}).`;
+  }
+}
+
+async function analyzeWithGemini(payload: AnalyzePayload): Promise<GeminiResponse> {
+  console.log('[VAAKYA] Calling backend /api/analyze —', 'textData' in payload ? 'text upload' : `mimeType: ${payload.mimeType}`);
+
+  let response: Response;
+  try {
+    response = await fetch('/api/analyze', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  } catch (err) {
+    console.error('[VAAKYA] Network error calling /api/analyze:', err);
+    throw new AnalyzeApiError("Could not reach the analysis server. Check your connection and try again.", 0);
+  }
 
   console.log('[VAAKYA] Backend response status:', response.status);
 
   if (!response.ok) {
     const errorData = await response.json().catch(() => ({ error: 'Unknown error' }));
     console.error('[VAAKYA] Backend error:', response.status, errorData);
-    throw new Error(`API error: ${response.status} - ${errorData.error || 'Unknown'}`);
+    throw new AnalyzeApiError(
+      analyzeErrorMessage(response.status, typeof errorData.error === "string" ? errorData.error : undefined),
+      response.status
+    );
   }
 
   const parsed = await response.json();
@@ -651,21 +647,26 @@ export default function DemoSection() {
       setError(null);
       setActiveDemo("upload");
 
-      // File size check
-      if (file.size > 10 * 1024 * 1024) {
-        setError("File too large. Please upload a file under 10MB.");
+      const upload = classifyUpload(file);
+      if (upload.kind === "unsupported") {
+        setError("Unsupported file type. Please upload a PDF, JPG, PNG, WEBP, or TXT file.");
         return;
       }
-      if (file.size > 4 * 1024 * 1024) {
-        console.warn('[VAAKYA] Large file detected — analysis may take 20-30 seconds');
+      // Vercel serverless rejects request bodies over ~4.5MB, and base64
+      // inflates files ~33% — so cap uploads before they ever leave the browser.
+      if (file.size > MAX_UPLOAD_BYTES) {
+        setError(`File too large. Please upload a file under ${MAX_UPLOAD_LABEL}.`);
+        return;
       }
 
       console.log('[VAAKYA] Uploading file:', file.name, 'size:', file.size, 'type:', file.type);
 
       try {
-        const { base64, mimeType } = await fileToBase64(file);
-        console.log('[VAAKYA] File converted to base64, mimeType:', mimeType, 'base64 length:', base64.length);
-        const data = await analyzeWithGemini(base64, mimeType);
+        const payload: AnalyzePayload =
+          upload.kind === "text"
+            ? { textData: await fileToText(file) }
+            : { base64Data: await fileToBase64(file), mimeType: upload.mimeType };
+        const data = await analyzeWithGemini(payload);
         console.log('[VAAKYA] ✅ Gemini returned real analysis results:', JSON.stringify(data).substring(0, 200));
         runAnalysisSequence(data);
       } catch (err: unknown) {
@@ -674,9 +675,12 @@ export default function DemoSection() {
           console.error('[VAAKYA] Error message:', err.message);
           console.error('[VAAKYA] Error stack:', err.stack);
         }
-        // Show brief warning then auto-dismiss after 3 seconds
-        setError("Could not analyze your document. Showing demo results. Check console (F12) for details.");
-        setTimeout(() => setError(null), 5000);
+        const message =
+          err instanceof AnalyzeApiError
+            ? err.message
+            : "Could not analyze your document.";
+        setError(`${message} Showing demo results instead.`);
+        setTimeout(() => setError(null), 8000);
         runAnalysisSequence(sampleData.rental);
       }
     },
@@ -781,7 +785,7 @@ export default function DemoSection() {
             <input
               ref={fileInputRef}
               type="file"
-              accept=".pdf,.jpg,.jpeg,.png"
+              accept={UPLOAD_ACCEPT_ATTR}
               onChange={handleFileSelect}
               className="hidden"
             />

@@ -15,6 +15,7 @@ import TechStack from "@/components/TechStack";
 import Footer from "@/components/Footer";
 import CallToAction from "@/components/CallToAction";
 import VaakyaChatbot from "@/components/VaakyaChatbot";
+import ErrorBoundary from "@/components/ErrorBoundary";
 
 export default function Home() {
   return (
@@ -30,7 +31,9 @@ export default function Home() {
         <HowItWorks />
       </div>
       <div id="demo">
-        <DemoSection />
+        <ErrorBoundary>
+          <DemoSection />
+        </ErrorBoundary>
       </div>
       <div id="agents">
         <AgentCards />
@@ -49,7 +52,9 @@ export default function Home() {
       </div>
       <CallToAction />
       <Footer />
-      <VaakyaChatbot />
+      <ErrorBoundary>
+        <VaakyaChatbot />
+      </ErrorBoundary>
       <FAB />
     </main>
   );

@@ -1,14 +1,25 @@
 import { NextRequest, NextResponse } from "next/server";
+import {
+  callGeminiWithFallback,
+  GeminiGenerateResponse,
+} from "@/lib/gemini";
+import { checkRateLimit, getClientIp } from "@/lib/rateLimit";
+import {
+  ANALYZE_FETCH_TIMEOUT_MS,
+  ANALYZE_MAX_OUTPUT_TOKENS,
+  ANALYZE_RATE_LIMIT,
+  ANALYZE_RETRY_DELAYS_MS,
+  MAX_BASE64_LENGTH,
+  MAX_UPLOAD_LABEL,
+} from "@/lib/config";
 
-const GEMINI_MODELS = [
-  "gemini-2.0-flash",
-  "gemini-2.0-flash-001",
-  "gemini-2.0-flash-lite",
-];
+export const runtime = "nodejs";
+// Must be a literal (Next.js statically analyzes segment config) — keep in
+// sync with ROUTE_MAX_DURATION_SECONDS in lib/config.ts.
+export const maxDuration = 60;
 
-const SYSTEM_PROMPT = `You are an expert Indian consumer rights and legal document analyzer. 
-Analyze this document carefully and return ONLY valid JSON — absolutely no markdown, 
-no backticks, no explanation, just raw JSON starting with { and ending with }:
+const SYSTEM_PROMPT = `You are an expert Indian consumer rights and legal document analyzer.
+Analyze this document carefully and return ONLY valid JSON matching this shape:
 
 {
   "summary": {
@@ -42,78 +53,70 @@ no backticks, no explanation, just raw JSON starting with { and ending with }:
   ]
 }
 
-Find ALL violations. Cite Consumer Protection Act 2019, RERA, IRDA, 
+Find ALL violations. Cite Consumer Protection Act 2019, RERA, IRDA,
 RBI Master Circulars, IPC, Model Tenancy Act 2021, Rent Control Act.
 Be specific. Return minimum 2 violations if any exist.
 If the document is in Tamil or Hindi, still return JSON in English.`;
 
-async function callGeminiWithRetry(
-  apiKey: string,
-  base64Data: string,
-  mimeType: string
-): Promise<Response> {
-  for (const model of GEMINI_MODELS) {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+// Enforced via generationConfig.responseSchema so Gemini returns strict JSON
+// instead of prose-wrapped markdown.
+const RESPONSE_SCHEMA = {
+  type: "OBJECT",
+  properties: {
+    summary: {
+      type: "OBJECT",
+      properties: {
+        type: { type: "STRING" },
+        parties: { type: "ARRAY", items: { type: "STRING" } },
+        date: { type: "STRING" },
+        duration: { type: "STRING" },
+      },
+      required: ["type", "parties", "date", "duration"],
+    },
+    violations: {
+      type: "ARRAY",
+      items: {
+        type: "OBJECT",
+        properties: {
+          severity: { type: "STRING" },
+          title: { type: "STRING" },
+          description: { type: "STRING" },
+          law: { type: "STRING" },
+          amount_recoverable: { type: "STRING" },
+        },
+        required: ["severity", "title", "description", "law", "amount_recoverable"],
+      },
+    },
+    rights: {
+      type: "ARRAY",
+      items: {
+        type: "OBJECT",
+        properties: {
+          title: { type: "STRING" },
+          description: { type: "STRING" },
+          law: { type: "STRING" },
+        },
+        required: ["title", "description", "law"],
+      },
+    },
+    legal_actions: {
+      type: "ARRAY",
+      items: {
+        type: "OBJECT",
+        properties: {
+          title: { type: "STRING" },
+          type: { type: "STRING" },
+          description: { type: "STRING" },
+        },
+        required: ["title", "type", "description"],
+      },
+    },
+  },
+  required: ["summary", "violations", "rights", "legal_actions"],
+};
 
-      console.log(`[VAAKYA API] Trying model=${model}, attempt=${attempt + 1}`);
-
-      const response = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [
-            {
-              parts: [
-                {
-                  inline_data: {
-                    mime_type: mimeType,
-                    data: base64Data,
-                  },
-                },
-                { text: SYSTEM_PROMPT },
-              ],
-            },
-          ],
-          generationConfig: {
-            maxOutputTokens: 2048,
-            temperature: 0.1,
-          },
-        }),
-      });
-
-      console.log(`[VAAKYA API] model=${model} attempt=${attempt + 1} status=${response.status}`);
-
-      if (response.ok) {
-        return response;
-      }
-
-      if (response.status === 429) {
-        // Rate limited — wait with exponential backoff then retry
-        const waitMs = Math.min(1000 * Math.pow(2, attempt), 8000);
-        console.log(`[VAAKYA API] Rate limited. Waiting ${waitMs}ms before retry...`);
-        await new Promise((resolve) => setTimeout(resolve, waitMs));
-        continue;
-      }
-
-      if (response.status === 404) {
-        // Model not found — skip to next model
-        console.log(`[VAAKYA API] Model ${model} not found, trying next...`);
-        break;
-      }
-
-      // Other error — return it
-      return response;
-    }
-  }
-
-  // If all models/retries exhausted, return a synthetic error
-  return new Response(
-    JSON.stringify({ error: "All Gemini models exhausted after retries" }),
-    { status: 503, headers: { "Content-Type": "application/json" } }
-  );
-}
-
+// Defensive fallback only — with responseMimeType: "application/json" the
+// direct JSON.parse should succeed and this should rarely run.
 function parseGeminiJson(rawText: string): Record<string, unknown> {
   let cleanText = rawText.trim();
   cleanText = cleanText.replace(/```json/g, "").replace(/```/g, "").trim();
@@ -127,63 +130,148 @@ function parseGeminiJson(rawText: string): Record<string, unknown> {
 }
 
 export async function POST(request: NextRequest) {
-  try {
-    const body = await request.json();
-    const { base64Data, mimeType } = body;
+  const ip = getClientIp(request.headers);
+  const rate = checkRateLimit(
+    `analyze:${ip}`,
+    ANALYZE_RATE_LIMIT.limit,
+    ANALYZE_RATE_LIMIT.windowMs
+  );
+  if (!rate.allowed) {
+    return NextResponse.json(
+      { error: "Too many requests. Please wait a minute and try again." },
+      { status: 429, headers: { "Retry-After": String(rate.retryAfterSeconds) } }
+    );
+  }
 
-    if (!base64Data || !mimeType) {
+  try {
+    const body = (await request.json()) as {
+      base64Data?: unknown;
+      mimeType?: unknown;
+      textData?: unknown;
+    };
+    const base64Data =
+      typeof body.base64Data === "string" ? body.base64Data : null;
+    const mimeType = typeof body.mimeType === "string" ? body.mimeType : null;
+    const textData = typeof body.textData === "string" ? body.textData : null;
+
+    if (!textData && !(base64Data && mimeType)) {
       return NextResponse.json(
-        { error: "Missing base64Data or mimeType" },
+        { error: "Missing base64Data/mimeType or textData" },
         { status: 400 }
       );
     }
 
-    // Use server-side env var (no NEXT_PUBLIC_ prefix needed on server)
-    const apiKey =
-      process.env.GEMINI_API_KEY ||
-      process.env.NEXT_PUBLIC_GEMINI_API_KEY ||
-      "AIzaSyCa14JdI-EdUgFu4SiXnkxw0-FJCK0ySek";
-
-    if (!apiKey) {
+    // Vercel normally rejects oversized bodies with 413 before we run; this
+    // guard covers local dev and keeps the contract explicit.
+    if (base64Data && base64Data.length > MAX_BASE64_LENGTH) {
       return NextResponse.json(
-        { error: "API key not configured" },
+        { error: `File too large. Maximum upload size is ${MAX_UPLOAD_LABEL}.` },
+        { status: 413 }
+      );
+    }
+
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      console.error("[VAAKYA ANALYZE] GEMINI_API_KEY is not set in this environment");
+      return NextResponse.json(
+        {
+          error:
+            "GEMINI_API_KEY is not configured. Locally: add it to .env.local. On Vercel: set it under Project → Settings → Environment Variables (.env.local never deploys).",
+        },
         { status: 500 }
       );
     }
 
-    console.log("[VAAKYA API] Starting document analysis...");
+    console.log("[VAAKYA ANALYZE] Starting document analysis...");
 
-    const response = await callGeminiWithRetry(apiKey, base64Data, mimeType);
+    const documentPart = textData
+      ? { text: `Document text to analyze:\n\n${textData}` }
+      : { inline_data: { mime_type: mimeType, data: base64Data } };
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error("[VAAKYA API] Final error:", response.status, errorText);
+    const result = await callGeminiWithFallback({
+      apiKey,
+      endpoint: "generateContent",
+      body: {
+        contents: [{ parts: [documentPart, { text: SYSTEM_PROMPT }] }],
+        generationConfig: {
+          maxOutputTokens: ANALYZE_MAX_OUTPUT_TOKENS,
+          temperature: 0.1,
+          responseMimeType: "application/json",
+          responseSchema: RESPONSE_SCHEMA,
+        },
+      },
+      timeoutMs: ANALYZE_FETCH_TIMEOUT_MS,
+      retryDelaysMs: ANALYZE_RETRY_DELAYS_MS,
+      logTag: "VAAKYA ANALYZE",
+    });
+
+    if (!result.ok) {
       return NextResponse.json(
-        { error: `Gemini API error: ${response.status}`, details: errorText },
-        { status: response.status }
+        { error: result.error, details: result.details },
+        { status: result.status }
       );
     }
 
-    const data = await response.json();
-    const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    const data = (await result.response.json()) as GeminiGenerateResponse;
 
-    if (!rawText) {
-      console.error("[VAAKYA API] No text in response:", JSON.stringify(data).substring(0, 300));
+    // Legal documents can trip safety filters — surface that clearly instead
+    // of a generic "empty response".
+    const blockReason = data.promptFeedback?.blockReason;
+    if (blockReason) {
+      console.error(`[VAAKYA ANALYZE] Prompt blocked: ${blockReason}`);
       return NextResponse.json(
-        { error: "Empty response from Gemini" },
+        {
+          error: `This document could not be analyzed (blocked by content filter: ${blockReason}). Please try a different document.`,
+        },
+        { status: 422 }
+      );
+    }
+
+    const candidate = data.candidates?.[0];
+    if (!candidate) {
+      console.error(
+        "[VAAKYA ANALYZE] No candidates in response:",
+        JSON.stringify(data).substring(0, 300)
+      );
+      return NextResponse.json(
+        { error: "This document could not be analyzed. Please try a clearer copy or a different document." },
+        { status: 422 }
+      );
+    }
+
+    if (candidate.finishReason === "MAX_TOKENS") {
+      console.error("[VAAKYA ANALYZE] Response truncated at MAX_TOKENS");
+      return NextResponse.json(
+        { error: "The analysis was too long and was cut off. Please try a shorter document." },
         { status: 502 }
       );
     }
 
-    console.log("[VAAKYA API] Raw response (first 300 chars):", rawText.substring(0, 300));
+    const rawText = (candidate.content?.parts ?? [])
+      .map((p) => p.text ?? "")
+      .join("");
+    if (!rawText) {
+      console.error(
+        "[VAAKYA ANALYZE] No text in candidate:",
+        JSON.stringify(data).substring(0, 300)
+      );
+      return NextResponse.json(
+        { error: "This document could not be analyzed. Please try a different document." },
+        { status: 422 }
+      );
+    }
 
-    const parsed = parseGeminiJson(rawText);
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(rawText);
+    } catch {
+      parsed = parseGeminiJson(rawText);
+    }
 
-    console.log("[VAAKYA API] ✅ Successfully parsed Gemini response");
-
+    console.log(`[VAAKYA ANALYZE] ✅ Parsed analysis (model=${result.model})`);
     return NextResponse.json(parsed);
   } catch (error) {
-    console.error("[VAAKYA API] Server error:", error);
+    console.error("[VAAKYA ANALYZE] Server error:", error);
     return NextResponse.json(
       { error: "Internal server error", message: String(error) },
       { status: 500 }

@@ -1,13 +1,20 @@
 import { NextRequest, NextResponse } from "next/server";
+import { callGeminiWithFallback } from "@/lib/gemini";
+import { checkRateLimit, getClientIp } from "@/lib/rateLimit";
+import {
+  CHAT_FETCH_TIMEOUT_MS,
+  CHAT_MAX_OUTPUT_TOKENS,
+  CHAT_RATE_LIMIT,
+  CHAT_RETRY_DELAYS_MS,
+} from "@/lib/config";
 
-const GEMINI_MODELS = [
-  "gemini-2.0-flash",
-  "gemini-2.0-flash-001",
-  "gemini-2.0-flash-lite",
-];
+export const runtime = "nodejs";
+// Must be a literal (Next.js statically analyzes segment config) — keep in
+// sync with ROUTE_MAX_DURATION_SECONDS in lib/config.ts.
+export const maxDuration = 60;
 
 const SYSTEM_INSTRUCTION = `You are VAAKYA Assistant, an expert AI legal rights advisor for India.
-                 
+
 VAAKYA AI facts:
 - Analyzes: rental agreements, insurance rejections, bank statements, job offers, utility bills
 - 4 agents: DRISHTI (OCR), NYAYA (Rights Analyzer), SATYA (Fraud Detector), SHAKTI (Action)
@@ -22,126 +29,117 @@ Rules:
 - For complex questions, give detailed step-by-step answers
 - IMPORTANT: Detect the user's language from their message and respond in the SAME language
 - If user writes in Tamil, respond in Tamil
-- If user writes in Hindi, respond in Hindi  
+- If user writes in Hindi, respond in Hindi
 - If user writes in English, respond in English
 - Always end with an actionable next step or suggestion
 - Never refuse to answer legal rights questions
 - For very complex cases, recommend uploading to VAAKYA for precise analysis`;
 
-interface ChatMessage {
-  role: string;
-  parts: { text: string }[];
-}
-
-async function callGeminiChat(
-  apiKey: string,
-  conversationHistory: ChatMessage[]
-): Promise<Response> {
-  for (const model of GEMINI_MODELS) {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-
-      console.log(`[VAAKYA CHAT] Trying model=${model}, attempt=${attempt + 1}`);
-
-      const response = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          system_instruction: {
-            parts: [{ text: SYSTEM_INSTRUCTION }],
-          },
-          contents: conversationHistory,
-          generationConfig: {
-            maxOutputTokens: 300,
-            temperature: 0.7,
-          },
-        }),
-      });
-
-      console.log(`[VAAKYA CHAT] model=${model} attempt=${attempt + 1} status=${response.status}`);
-
-      if (response.ok) {
-        return response;
-      }
-
-      if (response.status === 429) {
-        const waitMs = Math.min(1000 * Math.pow(2, attempt), 8000);
-        console.log(`[VAAKYA CHAT] Rate limited. Waiting ${waitMs}ms...`);
-        await new Promise((resolve) => setTimeout(resolve, waitMs));
-        continue;
-      }
-
-      if (response.status === 404) {
-        console.log(`[VAAKYA CHAT] Model ${model} not found, trying next...`);
-        break;
-      }
-
-      return response;
-    }
+export async function POST(request: NextRequest) {
+  const ip = getClientIp(request.headers);
+  const rate = checkRateLimit(
+    `chat:${ip}`,
+    CHAT_RATE_LIMIT.limit,
+    CHAT_RATE_LIMIT.windowMs
+  );
+  if (!rate.allowed) {
+    return NextResponse.json(
+      { error: "Too many messages. Please wait a minute and try again." },
+      { status: 429, headers: { "Retry-After": String(rate.retryAfterSeconds) } }
+    );
   }
 
-  return new Response(
-    JSON.stringify({ error: "All Gemini models exhausted" }),
-    { status: 503, headers: { "Content-Type": "application/json" } }
-  );
-}
-
-export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
     const { messages } = body;
 
     if (!messages || !Array.isArray(messages)) {
-      return NextResponse.json(
-        { error: "Missing messages array" },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: "Missing messages array" }, { status: 400 });
     }
 
-    const apiKey =
-      process.env.GEMINI_API_KEY ||
-      process.env.NEXT_PUBLIC_GEMINI_API_KEY ||
-      "AIzaSyCa14JdI-EdUgFu4SiXnkxw0-FJCK0ySek";
-
+    const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
+      console.error("[VAAKYA CHAT] GEMINI_API_KEY is not set in this environment");
       return NextResponse.json(
-        { error: "API key not configured" },
+        {
+          error:
+            "GEMINI_API_KEY is not configured. Locally: add it to .env.local. On Vercel: set it under Project → Settings → Environment Variables (.env.local never deploys).",
+        },
         { status: 500 }
       );
     }
 
-    console.log("[VAAKYA CHAT] Processing chat request...");
+    const result = await callGeminiWithFallback({
+      apiKey,
+      endpoint: "streamGenerateContent",
+      sse: true,
+      body: {
+        system_instruction: { parts: [{ text: SYSTEM_INSTRUCTION }] },
+        contents: messages,
+        generationConfig: {
+          maxOutputTokens: CHAT_MAX_OUTPUT_TOKENS,
+          temperature: 0.7,
+        },
+      },
+      timeoutMs: CHAT_FETCH_TIMEOUT_MS,
+      retryDelaysMs: CHAT_RETRY_DELAYS_MS,
+      logTag: "VAAKYA CHAT",
+    });
 
-    const response = await callGeminiChat(apiKey, messages);
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error("[VAAKYA CHAT] Final error:", response.status, errorText);
+    if (!result.ok) {
+      // 429 gets a specific body so the client can show "high traffic".
       return NextResponse.json(
-        { error: `Chat API error: ${response.status}` },
-        { status: response.status }
+        { error: result.error, details: result.details },
+        { status: result.status }
       );
     }
 
-    const data = await response.json();
-    const reply = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-
-    if (!reply) {
-      console.error("[VAAKYA CHAT] No text in response");
+    const upstream = result.response.body;
+    if (!upstream) {
       return NextResponse.json(
-        { error: "Empty response" },
+        { error: "Empty stream from Gemini" },
         { status: 502 }
       );
     }
 
-    console.log("[VAAKYA CHAT] ✅ Got reply:", reply.substring(0, 100));
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream({
+      async start(controller) {
+        const reader = upstream.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop() ?? "";
+            for (const line of lines) {
+              if (!line.startsWith("data: ")) continue;
+              const json = line.slice(6).trim();
+              if (!json || json === "[DONE]") continue;
+              try {
+                const parsed = JSON.parse(json);
+                const text = parsed?.candidates?.[0]?.content?.parts?.[0]?.text;
+                if (text) controller.enqueue(encoder.encode(text));
+              } catch {}
+            }
+          }
+        } catch (err) {
+          // Upstream aborted mid-stream (e.g. fetch timeout) — end what we have.
+          console.error("[VAAKYA CHAT] Stream interrupted:", err);
+        } finally {
+          controller.close();
+        }
+      },
+    });
 
-    return NextResponse.json({ reply });
+    return new Response(stream, {
+      headers: { "Content-Type": "text/plain; charset=utf-8" },
+    });
   } catch (error) {
-    console.error("[VAAKYA CHAT] Server error:", error);
-    return NextResponse.json(
-      { error: "Internal server error" },
-      { status: 500 }
-    );
+    console.error("[VAAKYA CHAT] Error:", error);
+    return NextResponse.json({ error: "Internal server error" }, { status: 500 });
   }
 }

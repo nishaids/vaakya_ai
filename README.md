@@ -70,6 +70,17 @@ Bank Hidden Charges Detection
 Employment Contract Analysis
 Consumer Rights Protection
 
+🔑 API Key Setup (REQUIRED)
+
+⚠️ The previous GEMINI_API_KEY was exposed (committed in .env.local inside a shared zip) and MUST be rotated:
+
+1. Go to Google AI Studio (https://aistudio.google.com/apikey), delete the old key, and create a new one.
+2. On Vercel: Project → Settings → Environment Variables → add GEMINI_API_KEY with the new key. (.env.local never deploys to Vercel — a key set only there causes "GEMINI_API_KEY is not configured" errors in production.)
+3. Redeploy the project so the new variable takes effect.
+4. For local development, put the new key in .env.local (it is gitignored).
+
+Optional: set GEMINI_MODELS (comma-separated model IDs) to override the default model chain in lib/config.ts without a code change.
+
 Clone Repository
 
 git clone https://github.com/nishaids/VAAKYA-AI.git

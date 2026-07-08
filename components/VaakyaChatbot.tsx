@@ -10,6 +10,8 @@ interface Message {
   role: "user" | "assistant";
   content: string;
   timestamp: Date;
+  /** True when the API was unreachable and this is a canned fallback reply. */
+  offline?: boolean;
 }
 
 const quickSuggestions = [
@@ -20,9 +22,10 @@ const quickSuggestions = [
 ];
 
 const quickActions = [
-  "action1",
-  "action2",
-  "action3",
+  { label: "What is VAAKYA AI?", prompt: "What is VAAKYA AI and how does it work?" },
+  { label: "Rental rights", prompt: "What are my rights as a tenant under Indian law?" },
+  { label: "Insurance rejected", prompt: "My insurance claim was rejected. What can I do under IRDA rules?" },
+  { label: "Bank hidden fee", prompt: "My bank charged hidden fees illegally. How do I get a refund?" },
 ];
 
 const getSmartResponse = (text: string): string => {
@@ -137,33 +140,42 @@ export default function VaakyaChatbot() {
       
       console.log('[VAAKYA CHAT] Response status:', response.status);
       
-      if (!response.ok) {
+      if (!response.ok || !response.body) {
         const errData = await response.json().catch(() => ({}));
-        console.error('[VAAKYA CHAT] API error:', response.status, errData);
+        console.error('[VAAKYA CHAT] ❌ API error — status:', response.status, 'body:', errData);
         throw new Error(`API failed: ${response.status}`);
       }
-      
-      const data = await response.json();
-      const reply = data.reply || getSmartResponse(userText);
-      
-      console.log('[VAAKYA CHAT] ✅ Got reply:', reply.substring(0, 100));
-      
+
+      const streamingId = (Date.now() + 1).toString();
+      setMessages(prev => [
+        ...prev,
+        { id: streamingId, role: 'assistant', content: '', timestamp: new Date() }
+      ]);
       setIsTyping(false);
-      setMessages(prev => [...prev, {
-        id: (Date.now() + 1).toString(),
-        role: 'assistant',
-        content: reply,
-        timestamp: new Date()
-      }]);
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let full = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        full += decoder.decode(value, { stream: true });
+        setMessages(prev =>
+          prev.map(m => (m.id === streamingId ? { ...m, content: full } : m))
+        );
+      }
       
     } catch (err) {
-      console.error('[VAAKYA CHAT] ❌ Failed:', err);
+      // Keep the canned fallback (good for expo demos) but flag it so the
+      // operator can see the backend is actually down.
+      console.error('[VAAKYA CHAT] ❌ API unavailable, falling back to offline responses:', err);
       setIsTyping(false);
       setMessages(prev => [...prev, {
         id: (Date.now() + 1).toString(),
         role: 'assistant',
         content: getSmartResponse(userText),
-        timestamp: new Date()
+        timestamp: new Date(),
+        offline: true
       }]);
     }
   };
@@ -184,8 +196,8 @@ export default function VaakyaChatbot() {
     await sendMessage(suggestion);
   };
 
-  const handleQuickAction = async (action: string) => {
-    await sendMessage(action);
+  const handleQuickAction = async (prompt: string) => {
+    await sendMessage(prompt);
   };
 
   const handleClear = () => {
@@ -216,7 +228,7 @@ export default function VaakyaChatbot() {
 
         {/* Notification dot */}
         <div className="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-[#8B5CF6] flex items-center justify-center">
-          <div className="absolute w-full h-full rounded-full bg-[#8B5CF6] animate-ping opacity-75" />
+          <div className="w-full h-full rounded-full bg-[#8B5CF6] animate-ping opacity-75" />
         </div>
 
         <button
@@ -292,6 +304,9 @@ export default function VaakyaChatbot() {
                         : "bg-[#12111E] border border-[rgba(139,92,246,0.15)] text-[#E2E8F0] rounded-bl-4"
                     }`}
                   >
+                    {message.offline && (
+                      <p className="text-[10px] text-[#F59E0B] mb-1 font-medium">⚡ offline mode</p>
+                    )}
                     <p>{message.content}</p>
                     <p className="text-[#475569] text-[11px] mt-1">{formatTime(message.timestamp)}</p>
                   </div>
@@ -313,7 +328,7 @@ export default function VaakyaChatbot() {
                 </div>
               )}
 
-              {messages.length === 1 && !isTyping && (
+              {!isTyping && (
                 <div className="flex flex-wrap gap-2 mt-2">
                   {quickSuggestions.map((suggestion) => (
                     <button
@@ -335,11 +350,11 @@ export default function VaakyaChatbot() {
               <div className="flex gap-2 overflow-x-auto pb-1">
                 {quickActions.map((action) => (
                   <button
-                    key={action}
-                    onClick={() => handleQuickAction(t(action))}
+                    key={action.label}
+                    onClick={() => handleQuickAction(action.prompt)}
                     className="px-3 py-1.5 rounded-full text-[10px] border border-[rgba(139,92,246,0.3)] text-[#A09DB8] hover:bg-[rgba(139,92,246,0.1)] hover:text-[#8B5CF6] transition-colors whitespace-nowrap"
                   >
-                    {t(action)}
+                    {action.label}
                   </button>
                 ))}
               </div>
