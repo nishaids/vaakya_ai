@@ -612,6 +612,10 @@ export default function DemoSection() {
   const [expandedSections, setExpandedSections] = useState<number[]>([0, 1, 2]);
   const [results, setResults] = useState<GeminiResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // True while the document is being sent to the API and analyzed — shows the
+  // live progress panel immediately so users know work is happening.
+  const [isUploading, setIsUploading] = useState(false);
+  const [uploadedFileName, setUploadedFileName] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const timeoutsRef = useRef<NodeJS.Timeout[]>([]);
 
@@ -644,6 +648,7 @@ export default function DemoSection() {
 
   const handleFileUpload = useCallback(
     async (file: File) => {
+      if (isUploading) return;
       setError(null);
       setActiveDemo("upload");
 
@@ -661,6 +666,16 @@ export default function DemoSection() {
 
       console.log('[VAAKYA] Uploading file:', file.name, 'size:', file.size, 'type:', file.type);
 
+      // Clear any previous results right away and show the progress panel so
+      // the user sees the upload was received and analysis is running.
+      clearAllTimeouts();
+      setShowResults(false);
+      setResults(null);
+      setShowThinkingLog(false);
+      setIsAnalyzing(false);
+      setUploadedFileName(file.name);
+      setIsUploading(true);
+
       try {
         const payload: AnalyzePayload =
           upload.kind === "text"
@@ -668,6 +683,7 @@ export default function DemoSection() {
             : { base64Data: await fileToBase64(file), mimeType: upload.mimeType };
         const data = await analyzeWithGemini(payload);
         console.log('[VAAKYA] ✅ Gemini returned real analysis results:', JSON.stringify(data).substring(0, 200));
+        setIsUploading(false);
         runAnalysisSequence(data);
       } catch (err: unknown) {
         console.error('[VAAKYA] ❌ Document analysis failed:', err);
@@ -679,13 +695,27 @@ export default function DemoSection() {
           err instanceof AnalyzeApiError
             ? err.message
             : "Could not analyze your document.";
+        setIsUploading(false);
         setError(`${message} Showing demo results instead.`);
         setTimeout(() => setError(null), 8000);
         runAnalysisSequence(sampleData.rental);
       }
     },
-    [runAnalysisSequence]
+    [runAnalysisSequence, clearAllTimeouts, isUploading]
   );
+
+  const handleNewUpload = useCallback(() => {
+    clearAllTimeouts();
+    setShowResults(false);
+    setResults(null);
+    setShowThinkingLog(false);
+    setIsAnalyzing(false);
+    setIsUploading(false);
+    setActiveDemo(null);
+    setError(null);
+    setUploadedFileName(null);
+    fileInputRef.current?.click();
+  }, [clearAllTimeouts]);
 
   const startDemo = useCallback(
     (type: string) => {
@@ -709,6 +739,8 @@ export default function DemoSection() {
   const handleFileSelect = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
       const file = e.target.files?.[0];
+      // Reset so picking the same file again still fires onChange.
+      e.target.value = "";
       if (file) handleFileUpload(file);
     },
     [handleFileUpload]
@@ -791,22 +823,45 @@ export default function DemoSection() {
             />
 
             <div
-              onClick={() => fileInputRef.current?.click()}
+              onClick={() => !isUploading && fileInputRef.current?.click()}
               onDrop={handleDrop}
               onDragOver={(e) => e.preventDefault()}
-              className="upload-zone relative border-2 border-dashed border-accent-primary/30 rounded-[20px] min-h-[200px] flex flex-col items-center justify-center gap-4 bg-accent-primary/[0.03] hover:bg-accent-primary/[0.08] hover:border-solid hover:border-accent-primary/60 hover:scale-[1.01] transition-all duration-300 cursor-pointer group mb-6"
+              className={`upload-zone relative border-2 border-dashed border-accent-primary/30 rounded-[20px] min-h-[200px] flex flex-col items-center justify-center gap-4 bg-accent-primary/[0.03] transition-all duration-300 group mb-6 ${
+                isUploading
+                  ? "opacity-60 cursor-wait"
+                  : "hover:bg-accent-primary/[0.08] hover:border-solid hover:border-accent-primary/60 hover:scale-[1.01] cursor-pointer"
+              }`}
             >
               <span className="corner-tl border-accent-primary/30" />
               <span className="corner-tr border-accent-primary/30" />
-              <Upload className="w-8 h-8 text-accent-primary/50 group-hover:text-accent-primary transition-colors" />
-              <div className="text-center">
-                <p className="text-text-secondary text-[14px] font-body group-hover:text-text-primary transition-colors">
-                  {t("dropMain")}
-                </p>
-                <p className="text-text-muted text-[12px] font-body mt-1">
-                  {t("dropFormat")}
-                </p>
-              </div>
+              {isUploading ? (
+                <>
+                  <div
+                    className="w-8 h-8 border-[3px] rounded-full animate-spin"
+                    style={{ borderColor: "#8B5CF6", borderTopColor: "transparent" }}
+                  />
+                  <div className="text-center">
+                    <p className="text-text-primary text-[14px] font-body font-semibold">
+                      Analyzing your document…
+                    </p>
+                    <p className="text-text-muted text-[12px] font-body mt-1">
+                      Working in the background — usually 10–30 seconds
+                    </p>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <Upload className="w-8 h-8 text-accent-primary/50 group-hover:text-accent-primary transition-colors" />
+                  <div className="text-center">
+                    <p className="text-text-secondary text-[14px] font-body group-hover:text-text-primary transition-colors">
+                      {t("dropMain")}
+                    </p>
+                    <p className="text-text-muted text-[12px] font-body mt-1">
+                      {t("dropFormat")}
+                    </p>
+                  </div>
+                </>
+              )}
             </div>
 
             <p className="text-text-muted text-[13px] font-body mb-3">
@@ -853,7 +908,7 @@ export default function DemoSection() {
           {/* Right panel — Results */}
           <div className="relative min-h-[500px]">
             <AnimatePresence mode="wait">
-              {!activeDemo && !isAnalyzing && !showResults && !showThinkingLog && (
+              {!activeDemo && !isAnalyzing && !showResults && !showThinkingLog && !isUploading && (
                 <motion.div
                   key="empty"
                   initial={{ opacity: 0 }}
@@ -864,6 +919,41 @@ export default function DemoSection() {
                   <p className="text-text-muted text-[14px] font-body">
                     {t("demoPlaceholder")}
                   </p>
+                </motion.div>
+              )}
+
+              {isUploading && (
+                <motion.div
+                  key="uploading"
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  exit={{ opacity: 0 }}
+                  className="bg-bg-card/30 border border-white/[0.06] rounded-[20px] p-6"
+                >
+                  <div className="flex items-center gap-3 mb-5">
+                    <div
+                      className="w-5 h-5 border-2 rounded-full animate-spin flex-shrink-0"
+                      style={{ borderColor: "#8B5CF6", borderTopColor: "transparent" }}
+                    />
+                    <h4 className="font-mono text-[14px] text-accent-primary">
+                      Analyzing your document…
+                    </h4>
+                  </div>
+                  <div className="flex items-center gap-2 py-3 px-4 rounded-xl bg-bg-card/50 border border-white/[0.05] mb-3">
+                    <FileText className="w-4 h-4 text-accent-primary flex-shrink-0" />
+                    <span className="text-text-primary text-[13px] font-body truncate">
+                      {uploadedFileName}
+                    </span>
+                    <span className="ml-auto flex items-center gap-1.5 text-[12px] font-body flex-shrink-0" style={{ color: "#10B981" }}>
+                      <Check className="w-3.5 h-3.5" /> Uploaded
+                    </span>
+                  </div>
+                  <p className="text-text-secondary text-[13px] font-body leading-relaxed mb-6">
+                    VAAKYA AI agents are reading every clause and checking it against
+                    Indian law. This usually takes <strong>10–30 seconds</strong> —
+                    please keep this page open.
+                  </p>
+                  <ShimmerCard />
                 </motion.div>
               )}
 
@@ -945,6 +1035,26 @@ export default function DemoSection() {
                   animate={{ opacity: 1, y: 0 }}
                   className="bg-bg-card/30 border border-white/[0.06] rounded-[20px] p-6 max-h-[700px] overflow-y-auto"
                 >
+                  {/* Header: analysis done + start over */}
+                  <div className="flex items-center justify-between gap-3 mb-4">
+                    <span className="flex items-center gap-2 text-[13px] font-body" style={{ color: "#10B981" }}>
+                      <Check className="w-4 h-4" />
+                      Analysis complete
+                      {uploadedFileName && activeDemo === "upload" && (
+                        <span className="text-text-muted truncate max-w-[180px]">
+                          — {uploadedFileName}
+                        </span>
+                      )}
+                    </span>
+                    <button
+                      onClick={handleNewUpload}
+                      className="flex items-center gap-2 px-4 py-2 rounded-xl border border-[rgba(139,92,246,0.4)] text-[#8B5CF6] hover:bg-[rgba(139,92,246,0.12)] font-body text-[13px] font-semibold transition-colors flex-shrink-0"
+                    >
+                      <Upload className="w-4 h-4" />
+                      Upload New Document
+                    </button>
+                  </div>
+
                   {/* Summary Bar */}
                   {(() => {
                     const total = getRecoverableTotal(results.violations);
