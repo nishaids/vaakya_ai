@@ -96,11 +96,7 @@ npm run dev
 Open Browser
 
 https://vaakya-ai.vercel.app
-👨‍💻 Team — Tech Fantoms
-R. Nishanth
-Maragadhavel T
-Lakshmi Narayanan S
-Praneshwaran H
+
 🎓 Project Info
 
 Built for Project Expo 2026
