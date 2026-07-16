@@ -28,9 +28,11 @@ export const ANALYZE_RETRY_DELAYS_MS: readonly number[] = [2_000, 5_000];
 export const CHAT_RETRY_DELAYS_MS: readonly number[] = [2_000, 4_000];
 export const RETRY_BUDGET_MS = 40_000;
 
-// 2048 truncated multi-violation analyses mid-JSON; 4096 leaves headroom.
-export const ANALYZE_MAX_OUTPUT_TOKENS = 4096;
-export const CHAT_MAX_OUTPUT_TOKENS = 500;
+// Gemini 2.5+/3.x "thinking" tokens count against maxOutputTokens, so the
+// budget must cover reasoning + the full JSON answer. 4096 was observed
+// truncating real analyses (finishReason=MAX_TOKENS).
+export const ANALYZE_MAX_OUTPUT_TOKENS = 8192;
+export const CHAT_MAX_OUTPUT_TOKENS = 1024;
 
 // --- Per-IP rate limits (in-memory, per serverless instance) ---
 export const ANALYZE_RATE_LIMIT = { limit: 10, windowMs: 60_000 };

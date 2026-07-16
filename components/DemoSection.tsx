@@ -470,7 +470,9 @@ function analyzeErrorMessage(status: number, serverMessage?: string): string {
     case 429:
       return "Too many requests right now — please wait a minute and try again.";
     case 422:
-      return "This document couldn't be analyzed. Try a clearer scan or a different file.";
+      // The server sends a specific reason (e.g. unsupported document type
+      // with what it detected) — show it verbatim.
+      return serverMessage || "This document couldn't be analyzed. Try a clearer scan or a different file.";
     case 503:
       return "The AI models are temporarily unavailable. Please try again later.";
     case 504:
@@ -694,11 +696,14 @@ export default function DemoSection() {
         const message =
           err instanceof AnalyzeApiError
             ? err.message
-            : "Could not analyze your document.";
+            : "Could not analyze your document. Please try again.";
+        // Never show fabricated results for a real upload — surface the real
+        // reason and return to the empty state so the user can retry.
         setIsUploading(false);
-        setError(`${message} Showing demo results instead.`);
-        setTimeout(() => setError(null), 8000);
-        runAnalysisSequence(sampleData.rental);
+        setUploadedFileName(null);
+        setActiveDemo(null);
+        setError(message);
+        setTimeout(() => setError(null), 12000);
       }
     },
     [runAnalysisSequence, clearAllTimeouts, isUploading]

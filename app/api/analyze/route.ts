@@ -19,50 +19,59 @@ export const runtime = "nodejs";
 export const maxDuration = 60;
 
 const SYSTEM_PROMPT = `You are an expert Indian consumer rights and legal document analyzer.
-Analyze this document carefully and return ONLY valid JSON matching this shape:
+Respond ONLY with valid JSON matching the provided schema.
 
-{
-  "summary": {
-    "type": "string describing document type",
-    "parties": ["Party 1 name", "Party 2 name"],
-    "date": "document date or Not specified",
-    "duration": "duration or Not applicable"
-  },
-  "violations": [
-    {
-      "severity": "ILLEGAL",
-      "title": "Short title of violation",
-      "description": "Clear description of the problem",
-      "law": "Exact Indian law section",
-      "amount_recoverable": "Amount or type of relief"
-    }
-  ],
-  "rights": [
-    {
-      "title": "Right name",
-      "description": "What this right means",
-      "law": "Exact law reference"
-    }
-  ],
-  "legal_actions": [
-    {
-      "title": "Action name",
-      "type": "Download",
-      "description": "What this action does"
-    }
-  ]
-}
+STEP 1 — CLASSIFY THE DOCUMENT FIRST.
+The ONLY supported document types are:
+1. Rental / lease / tenancy agreements
+2. Insurance documents — policies, claim rejection letters, premium or renewal notices
+3. Banking & loan documents — bank statements, loan/EMI statements, credit card statements, foreclosure or fee letters
+4. Property documents — sale deeds, builder-buyer agreements, RERA documents, property tax notices
 
-Find ALL violations. Cite Consumer Protection Act 2019, RERA, IRDA,
-RBI Master Circulars, IPC, Model Tenancy Act 2021, Rent Control Act.
-Be specific. Return minimum 2 violations if any exist.
-If the document is in Tamil or Hindi, still return JSON in English.`;
+If the document is NOT clearly one of these (for example: Aadhaar card, PAN card,
+passport, driving licence, voter ID, school/college assignment or notes, resume,
+certificate, marksheet, random photo, article, or anything else), set
+document_check.is_relevant to false, write a short honest description of what the
+document actually is in document_check.detected_type, set every string in summary to
+"Not applicable", set parties to an empty array, and set violations, rights, and
+legal_actions to EMPTY arrays. NEVER invent an analysis for an unsupported document.
+
+STEP 2 — ANALYZE (only when the document IS one of the supported types).
+Set document_check.is_relevant to true, describe the type in
+document_check.detected_type, and fill ALL FOUR fields: summary, violations, rights,
+and legal_actions. When is_relevant is true, every one of these four fields is
+MANDATORY (violations may be an empty array if the document is genuinely clean;
+rights and legal_actions should list what applies to this document type).
+
+STRICT TRUTHFULNESS RULES — these override everything else:
+- Base every statement ONLY on text actually present in the document. Never invent
+  clauses, party names, dates, policy numbers, or amounts.
+- Every violation must point to the specific clause, section, or line of the document
+  it comes from.
+- If the document contains NO violations, return an empty violations array. Do not
+  fabricate violations to fill the report.
+- Use amounts exactly as written in the document. If no amount is stated, write
+  "Not specified".
+- Cite real Indian laws: Consumer Protection Act 2019, RERA, IRDAI regulations,
+  RBI Master Circulars, IPC, Model Tenancy Act 2021, Rent Control Act. If you are not
+  certain of the exact section number, cite the Act alone — never invent section numbers.
+- Severity must be exactly one of: "ILLEGAL" (clear violation of a law),
+  "SUSPICIOUS" (likely unfair or void clause), "WARNING" (caution advised).
+- If the document is in Tamil or Hindi, still return JSON in English.`;
 
 // Enforced via generationConfig.responseSchema so Gemini returns strict JSON
 // instead of prose-wrapped markdown.
 const RESPONSE_SCHEMA = {
   type: "OBJECT",
   properties: {
+    document_check: {
+      type: "OBJECT",
+      properties: {
+        is_relevant: { type: "BOOLEAN" },
+        detected_type: { type: "STRING" },
+      },
+      required: ["is_relevant", "detected_type"],
+    },
     summary: {
       type: "OBJECT",
       properties: {
@@ -78,7 +87,7 @@ const RESPONSE_SCHEMA = {
       items: {
         type: "OBJECT",
         properties: {
-          severity: { type: "STRING" },
+          severity: { type: "STRING", enum: ["ILLEGAL", "SUSPICIOUS", "WARNING"] },
           title: { type: "STRING" },
           description: { type: "STRING" },
           law: { type: "STRING" },
@@ -112,7 +121,10 @@ const RESPONSE_SCHEMA = {
       },
     },
   },
-  required: ["summary", "violations", "rights", "legal_actions"],
+  // All fields are schema-required so the model can never drop one; for
+  // unsupported documents the prompt makes it return them EMPTY, and the
+  // is_relevant gate below stops them from ever reaching the user.
+  required: ["document_check", "summary", "violations", "rights", "legal_actions"],
 };
 
 // Defensive fallback only — with responseMimeType: "application/json" the
@@ -267,6 +279,47 @@ export async function POST(request: NextRequest) {
     } catch {
       parsed = parseGeminiJson(rawText);
     }
+
+    // Enforce the classification gate: only supported legal/consumer documents
+    // get a report. Anything else returns a clear "unsupported" error instead
+    // of a fabricated analysis.
+    const check = parsed.document_check as
+      | { is_relevant?: boolean; detected_type?: string }
+      | undefined;
+    if (!check || check.is_relevant !== true) {
+      const detected =
+        check && typeof check.detected_type === "string" && check.detected_type
+          ? ` It appears to be: ${check.detected_type}.`
+          : "";
+      console.log(`[VAAKYA ANALYZE] Unsupported document rejected.${detected}`);
+      return NextResponse.json(
+        {
+          error: `This document type is not supported.${detected} Please upload a rental agreement, insurance document, bank/loan statement, or property document.`,
+          code: "UNSUPPORTED_DOCUMENT",
+        },
+        { status: 422 }
+      );
+    }
+
+    // A relevant document must come back with a complete analysis.
+    if (
+      !parsed.summary ||
+      !Array.isArray(parsed.violations) ||
+      !Array.isArray(parsed.rights) ||
+      !Array.isArray(parsed.legal_actions)
+    ) {
+      console.error(
+        "[VAAKYA ANALYZE] Relevant document but incomplete analysis fields. Keys:",
+        Object.keys(parsed).join(","),
+        "| raw tail:",
+        rawText.slice(-300)
+      );
+      return NextResponse.json(
+        { error: "The document could not be analyzed reliably. Please try a clearer copy." },
+        { status: 422 }
+      );
+    }
+    delete parsed.document_check;
 
     console.log(`[VAAKYA ANALYZE] ✅ Parsed analysis (model=${result.model})`);
     return NextResponse.json(parsed);

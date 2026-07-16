@@ -210,13 +210,12 @@ export default function VaakyaChatbot() {
 
   return (
     <>
-      {/* Chat Trigger Button */}
-      <motion.div
-        className="fixed bottom-6 right-6 z-50 md:bottom-24 md:right-6"
-        initial={{ scale: 0 }}
-        animate={{ scale: 1 }}
-        transition={{ delay: 1 }}
-      >
+      {/* Chat Trigger Button — bottom-24 on ALL sizes: on mobile the FAB
+          (components/ui/FAB.tsx) occupies bottom-6 right-6 and was completely
+          covering this button, which is why chat was invisible on phones.
+          Deliberately a plain div with no entry animation: visibility must
+          never depend on a JS animation running on the user's device. */}
+      <div className="fixed bottom-24 right-6 z-50">
         {/* Tooltip */}
         <motion.div
           initial={{ opacity: 0, y: 10 }}
@@ -238,7 +237,7 @@ export default function VaakyaChatbot() {
         >
           <MessageCircle className="w-6 h-6" />
         </button>
-      </motion.div>
+      </div>
 
       {/* Chat Panel */}
       <AnimatePresence>

@@ -78,6 +78,7 @@ export async function callGeminiWithFallback(
   const deadline = Date.now() + RETRY_BUDGET_MS;
   const payload = JSON.stringify(body);
   let sawRateLimit = false;
+  let sawServerError = false;
 
   for (const model of models) {
     const url = `${GEMINI_API_BASE}/${model}:${endpoint}${sse ? "?alt=sse" : ""}`;
@@ -132,24 +133,27 @@ export async function callGeminiWithFallback(
         break;
       }
 
-      if (response.status === 429) {
-        sawRateLimit = true;
+      // 429 (quota) and 5xx (overloaded/unavailable) are transient: retry with
+      // a short wait, then fall through to the next model in the chain.
+      if (response.status === 429 || response.status >= 500) {
+        if (response.status === 429) sawRateLimit = true;
+        else sawServerError = true;
         if (attempt >= retryDelaysMs.length) break;
         const waitMs = parseRetryAfterMs(response) ?? retryDelaysMs[attempt];
         if (Date.now() + waitMs >= deadline) {
           console.warn(
-            `[${logTag}] model=${model} rate limited; retry would exceed budget — moving on`
+            `[${logTag}] model=${model} status=${response.status}; retry would exceed budget — moving on`
           );
           break;
         }
         console.warn(
-          `[${logTag}] model=${model} rate limited (attempt ${attempt + 1}), waiting ${waitMs}ms`
+          `[${logTag}] model=${model} status=${response.status} (attempt ${attempt + 1}), waiting ${waitMs}ms`
         );
         await sleep(waitMs);
         continue;
       }
 
-      // 400/403/5xx etc. — retrying or switching models won't help; surface it.
+      // 400/401/403 etc. — retrying or switching models won't help; surface it.
       const details = (await response.text().catch(() => "")).slice(0, 500);
       console.error(
         `[${logTag}] model=${model} → ${response.status}: ${details}`
@@ -169,6 +173,14 @@ export async function callGeminiWithFallback(
       status: 429,
       error:
         "The AI service is receiving too much traffic right now. Please try again in a minute.",
+    };
+  }
+  if (sawServerError) {
+    return {
+      ok: false,
+      status: 503,
+      error:
+        "The AI service is temporarily overloaded. Please try again in a few minutes.",
     };
   }
   return {
