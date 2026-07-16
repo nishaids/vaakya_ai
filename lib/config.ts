@@ -18,15 +18,20 @@ export const GEMINI_API_BASE =
 // so it cannot be imported from here. Keep them in sync.
 export const ROUTE_MAX_DURATION_SECONDS = 60;
 
-export const ANALYZE_FETCH_TIMEOUT_MS = 45_000;
-export const CHAT_FETCH_TIMEOUT_MS = 30_000;
+// Per-model fetch timeouts. Kept tight so that when the primary model hangs
+// under "high demand", there is still time inside the 60s function budget to
+// try the fallback model (observed answering the same request in ~3s).
+export const ANALYZE_FETCH_TIMEOUT_MS = 22_000;
+export const CHAT_FETCH_TIMEOUT_MS = 18_000;
 
-// 429 retry waits per model (attempt 1 → attempt 2). Total retry time across
-// all models is additionally capped by RETRY_BUDGET_MS so we never blow past
-// the function's maxDuration.
-export const ANALYZE_RETRY_DELAYS_MS: readonly number[] = [2_000, 5_000];
-export const CHAT_RETRY_DELAYS_MS: readonly number[] = [2_000, 4_000];
-export const RETRY_BUDGET_MS = 40_000;
+// 429/5xx retry waits per model (length = retries per model). One quick retry
+// each — hard quota exhaustion doesn't recover in seconds, and the next model
+// in the chain is the better bet.
+export const ANALYZE_RETRY_DELAYS_MS: readonly number[] = [2_000];
+export const CHAT_RETRY_DELAYS_MS: readonly number[] = [2_000];
+// Hard wall-clock budget for the whole model chain (fetches + retry waits),
+// leaving headroom inside Vercel's 60s maxDuration for parsing/response.
+export const GEMINI_TOTAL_BUDGET_MS = 50_000;
 
 // Gemini 2.5+/3.x "thinking" tokens count against maxOutputTokens, so the
 // budget must cover reasoning + the full JSON answer. 4096 was observed

@@ -36,12 +36,28 @@ document actually is in document_check.detected_type, set every string in summar
 "Not applicable", set parties to an empty array, and set violations, rights, and
 legal_actions to EMPTY arrays. NEVER invent an analysis for an unsupported document.
 
-STEP 2 — ANALYZE (only when the document IS one of the supported types).
+STEP 2 — AUTHENTICITY CHECK (only for supported document types).
+Honestly judge whether this looks like a real executed/issued document or not.
+Signals of a NON-genuine document: no signatures or stamps where they would be
+expected, placeholder or generic-looking names, "sample"/"draft"/"specimen"/"test"
+wording, template-like or machine-generated formatting instead of a real company
+letterhead, impossible or inconsistent dates and numbers.
+Set document_check.authenticity to exactly one of:
+- "APPEARS_GENUINE" — looks like a real executed or officially issued document
+- "SAMPLE_OR_TEST" — looks like a sample, draft, template, or generated test document
+- "SUSPICIOUS" — shows signs of tampering, forgery, or fabricated details
+and give the honest reason in document_check.authenticity_reason (one sentence).
+Never claim a document appears genuine unless you can actually see the signs.
+Still complete the analysis either way — the flag is shown to the user as a caution.
+
+STEP 3 — ANALYZE (only when the document IS one of the supported types).
 Set document_check.is_relevant to true, describe the type in
 document_check.detected_type, and fill ALL FOUR fields: summary, violations, rights,
 and legal_actions. When is_relevant is true, every one of these four fields is
 MANDATORY (violations may be an empty array if the document is genuinely clean;
 rights and legal_actions should list what applies to this document type).
+If the document is completely legal and fair, an EMPTY violations array is the
+correct and expected answer — do not manufacture problems.
 
 STRICT TRUTHFULNESS RULES — these override everything else:
 - Base every statement ONLY on text actually present in the document. Never invent
@@ -69,8 +85,13 @@ const RESPONSE_SCHEMA = {
       properties: {
         is_relevant: { type: "BOOLEAN" },
         detected_type: { type: "STRING" },
+        authenticity: {
+          type: "STRING",
+          enum: ["APPEARS_GENUINE", "SAMPLE_OR_TEST", "SUSPICIOUS"],
+        },
+        authenticity_reason: { type: "STRING" },
       },
-      required: ["is_relevant", "detected_type"],
+      required: ["is_relevant", "detected_type", "authenticity", "authenticity_reason"],
     },
     summary: {
       type: "OBJECT",
@@ -284,7 +305,12 @@ export async function POST(request: NextRequest) {
     // get a report. Anything else returns a clear "unsupported" error instead
     // of a fabricated analysis.
     const check = parsed.document_check as
-      | { is_relevant?: boolean; detected_type?: string }
+      | {
+          is_relevant?: boolean;
+          detected_type?: string;
+          authenticity?: string;
+          authenticity_reason?: string;
+        }
       | undefined;
     if (!check || check.is_relevant !== true) {
       const detected =
@@ -319,9 +345,26 @@ export async function POST(request: NextRequest) {
         { status: 422 }
       );
     }
+    // Pass the authenticity assessment through so the UI can warn about
+    // sample/generated or tampered-looking documents instead of presenting
+    // them as verified originals.
+    const validStatuses = ["APPEARS_GENUINE", "SAMPLE_OR_TEST", "SUSPICIOUS"];
+    parsed.authenticity = {
+      status: validStatuses.includes(check.authenticity ?? "")
+        ? check.authenticity
+        : "UNKNOWN",
+      reason:
+        typeof check.authenticity_reason === "string"
+          ? check.authenticity_reason
+          : "",
+    };
     delete parsed.document_check;
 
-    console.log(`[VAAKYA ANALYZE] ✅ Parsed analysis (model=${result.model})`);
+    console.log(
+      `[VAAKYA ANALYZE] ✅ Parsed analysis (model=${result.model}, authenticity=${
+        (parsed.authenticity as { status: string }).status
+      })`
+    );
     return NextResponse.json(parsed);
   } catch (error) {
     console.error("[VAAKYA ANALYZE] Server error:", error);

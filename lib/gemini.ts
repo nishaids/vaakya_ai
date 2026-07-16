@@ -6,7 +6,7 @@
 import {
   GEMINI_API_BASE,
   GEMINI_DEFAULT_MODELS,
-  RETRY_BUDGET_MS,
+  GEMINI_TOTAL_BUDGET_MS,
 } from "./config";
 
 export function getGeminiModels(): string[] {
@@ -75,15 +75,24 @@ export async function callGeminiWithFallback(
   const { apiKey, endpoint, sse, body, timeoutMs, retryDelaysMs, logTag } =
     options;
   const models = getGeminiModels();
-  const deadline = Date.now() + RETRY_BUDGET_MS;
+  // Hard wall-clock budget for the WHOLE chain — fetches count too, not just
+  // retry waits, so a hanging primary model can't eat the fallback's slot.
+  const deadline = Date.now() + GEMINI_TOTAL_BUDGET_MS;
   const payload = JSON.stringify(body);
   let sawRateLimit = false;
   let sawServerError = false;
+  let sawTimeout = false;
 
   for (const model of models) {
     const url = `${GEMINI_API_BASE}/${model}:${endpoint}${sse ? "?alt=sse" : ""}`;
 
     for (let attempt = 0; attempt <= retryDelaysMs.length; attempt++) {
+      const remainingMs = deadline - Date.now();
+      if (remainingMs < 3_000) {
+        console.warn(`[${logTag}] chain budget exhausted before model=${model}`);
+        break;
+      }
+
       let response: Response;
       try {
         response = await fetch(url, {
@@ -95,26 +104,22 @@ export async function callGeminiWithFallback(
             "x-goog-api-key": apiKey,
           },
           body: payload,
-          signal: AbortSignal.timeout(timeoutMs),
+          signal: AbortSignal.timeout(Math.min(timeoutMs, remainingMs)),
         });
       } catch (err) {
         if (
           err instanceof Error &&
           (err.name === "TimeoutError" || err.name === "AbortError")
         ) {
-          console.error(`[${logTag}] model=${model} timed out after ${timeoutMs}ms`);
-          return {
-            ok: false,
-            status: 504,
-            error: "The AI service did not respond in time. Please try again.",
-          };
+          // Model hanging under load — treat as transient and let the next
+          // model in the chain take over instead of failing the request.
+          console.error(`[${logTag}] model=${model} timed out — trying next model`);
+          sawTimeout = true;
+          break;
         }
-        console.error(`[${logTag}] model=${model} network error:`, err);
-        return {
-          ok: false,
-          status: 502,
-          error: "Could not reach the AI service. Please try again.",
-        };
+        console.error(`[${logTag}] model=${model} network error — trying next model:`, err);
+        sawServerError = true;
+        break;
       }
 
       if (response.ok) {
@@ -133,8 +138,8 @@ export async function callGeminiWithFallback(
         break;
       }
 
-      // 429 (quota) and 5xx (overloaded/unavailable) are transient: retry with
-      // a short wait, then fall through to the next model in the chain.
+      // 429 (quota) and 5xx (overloaded/unavailable) are transient: one quick
+      // retry, then fall through to the next model in the chain.
       if (response.status === 429 || response.status >= 500) {
         if (response.status === 429) sawRateLimit = true;
         else sawServerError = true;
@@ -167,20 +172,20 @@ export async function callGeminiWithFallback(
     }
   }
 
-  if (sawRateLimit) {
+  // Whole chain failed — pick the most accurate user-facing explanation.
+  if (sawServerError || sawRateLimit) {
     return {
       ok: false,
-      status: 429,
+      status: sawServerError ? 503 : 429,
       error:
-        "The AI service is receiving too much traffic right now. Please try again in a minute.",
+        "The AI service is temporarily overloaded. Please try again in a minute.",
     };
   }
-  if (sawServerError) {
+  if (sawTimeout) {
     return {
       ok: false,
-      status: 503,
-      error:
-        "The AI service is temporarily overloaded. Please try again in a few minutes.",
+      status: 504,
+      error: "The AI service did not respond in time. Please try again.",
     };
   }
   return {

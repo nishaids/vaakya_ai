@@ -67,6 +67,8 @@ interface GeminiResponse {
   violations: GeminiViolation[];
   rights: GeminiRight[];
   legal_actions: GeminiAction[];
+  /** Server-side authenticity assessment for real uploads (absent on samples). */
+  authenticity?: { status: string; reason: string };
 }
 
 const sampleData: Record<string, GeminiResponse> = {
@@ -1059,6 +1061,59 @@ export default function DemoSection() {
                       Upload New Document
                     </button>
                   </div>
+
+                  {/* Authenticity caution for sample/generated or suspicious uploads */}
+                  {results.authenticity &&
+                    results.authenticity.status !== "APPEARS_GENUINE" &&
+                    results.authenticity.status !== "UNKNOWN" && (
+                      <div
+                        style={{
+                          background:
+                            results.authenticity.status === "SUSPICIOUS"
+                              ? "rgba(239,68,68,0.1)"
+                              : "rgba(245,158,11,0.1)",
+                          border: `1px solid ${
+                            results.authenticity.status === "SUSPICIOUS"
+                              ? "rgba(239,68,68,0.35)"
+                              : "rgba(245,158,11,0.35)"
+                          }`,
+                          borderRadius: 10,
+                          padding: "12px 16px",
+                          marginBottom: 16,
+                          fontSize: 13,
+                          lineHeight: 1.6,
+                          color:
+                            results.authenticity.status === "SUSPICIOUS"
+                              ? "#EF4444"
+                              : "#F59E0B",
+                        }}
+                      >
+                        {results.authenticity.status === "SUSPICIOUS"
+                          ? "🚩 Warning: this document shows signs of being fabricated or tampered."
+                          : "⚠️ This appears to be a sample, draft, or generated document — not an executed original."}{" "}
+                        {results.authenticity.reason}
+                        {" "}The findings below describe this document&apos;s text — verify against the original before taking legal action.
+                      </div>
+                    )}
+
+                  {/* All-clear banner when the document is clean */}
+                  {results.violations.length === 0 && (
+                    <div
+                      style={{
+                        background: "rgba(16,185,129,0.1)",
+                        border: "1px solid rgba(16,185,129,0.35)",
+                        borderRadius: 10,
+                        padding: "12px 16px",
+                        marginBottom: 16,
+                        fontSize: 13,
+                        lineHeight: 1.6,
+                        color: "#10B981",
+                      }}
+                    >
+                      ✅ No violations found. Everything in this document appears
+                      legally compliant — no illegal or unfair clauses were detected.
+                    </div>
+                  )}
 
                   {/* Summary Bar */}
                   {(() => {
